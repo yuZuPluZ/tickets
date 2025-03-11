@@ -1,6 +1,9 @@
 from fasthtml.common import *
 from datetime import datetime
 from controller import *
+import hashlib
+from fastapi.responses import RedirectResponse
+import shutil  # Add this import
 
 app, rt = fast_app()
 
@@ -22,9 +25,11 @@ event = controller.create_event(
     date=datetime(2023, 8, 15),
     organizer=user,
     hall=hall1,
-    zones=[
-        {"type": "VIP", "percentage": 0.2, "price": 150.0},
-        {"type": "Regular", "percentage": 0.8, "price": 50.0}
+    description="A grand concert featuring popular artists.",
+    image_url="https://example.com/concert.jpg",
+    zones=[ 
+        {"type": "VIP", "percentage": 0.2, "price": 150.0, "quantity": int(hall1.capacity * 0.2)},
+        {"type": "Regular", "percentage": 0.8, "price": 50.0, "quantity": int(hall1.capacity * 0.8)}
     ]
 )
 event1 = controller.create_event(
@@ -32,35 +37,57 @@ event1 = controller.create_event(
     date=datetime(2023, 8, 15),
     organizer=user,
     hall=hall2,
+    description="Another amazing concert with different artists.",
+    image_url="https://example.com/concert2.jpg",
     zones=[
-        {"type": "VIP", "percentage": 0.2, "price": 150.0},
-        {"type": "Regular", "percentage": 0.8, "price": 50.0}
+        {"type": "VIP", "percentage": 0.2, "price": 150.0, "quantity": int(hall2.capacity * 0.2)},
+        {"type": "Regular", "percentage": 0.8, "price": 50.0, "quantity": int(hall2.capacity * 0.8)}
     ]
 )
 
+# Session management
+sessions = {}
+
+def get_current_user(req):
+    session_id = req.cookies.get("session_id")
+    if (session_id and session_id in sessions):
+        return sessions[session_id]
+    return None
+
 # Routes
 @rt("/")
-def home():
+def home(req):
     """Home page with links to events and user tickets."""
+    current_user = get_current_user(req)
+    user_info = P(f"Logged in as: {current_user.name}") if current_user else P("Not logged in")
     return Titled("Welcome", 
         Ul(
             Li(A(href="/events")("View Events")),
             Li(A(href="/user_tickets")("My Tickets")),
             Li(A(href="/create_event")("Create Event")),
             Li(A(href="/login")("Login")),
-            Li(A(href="/register")("Register"))
-        )
+            Li(A(href="/register")("Register")),
+            Li(A(href="/logout")("Logout")) if current_user else ""
+        ),
+        user_info
     )
 
 @rt("/events")
 def list_events():
     """List all events."""
     events = controller.get_events()  # Use a getter method
-    event_list = Ul(*[
-        Li(A(href=f"/event/{event.id}")(f"{event.name} - {event.date.strftime('%Y-%m-%d')}"))
-        for event in events
+    event_cards = Div(*[
+        Div(Class="card")(
+            Img(src=f"/{event.image_url}", Class="card-img-top", alt=event.name),
+            Div(Class="card-body")(
+                H5(Class="card-title")(event.name),
+                P(Class="card-text")(f"Date: {event.date.strftime('%Y-%m-%d')}"),
+                P(Class="card-text")(event.description),
+                A(href=f"/event/{event.id}", Class="btn btn-primary")("View Details")
+            )
+        ) for event in events
     ])
-    return Titled("Events", event_list)
+    return Titled("Events", event_cards)
 
 @rt("/event/{event_id:int}")
 def event_detail(event_id: int):
@@ -71,55 +98,96 @@ def event_detail(event_id: int):
     
     zones_info = Ul(*[
         Li(
-            f"{zone_type} - ${zone.price} ({zone.get_available_tickets_count()} available)",
-            Form(method="post", action=f"/purchase_tickets/{event.id}/{zone_type}")(
-                Input(type="number", name="quantity", min="1", max=str(zone.get_available_tickets_count()), required=True),
-                Button("Buy Tickets", type="submit")
-            )
+            f"{zone_type} - ${zone.price} ({zone.get_available_tickets_count()} available)"
         ) for zone_type, zone in event.zones.items()
     ])
     
+    vip_zone = event.zones.get("VIP")
+    regular_zone = event.zones.get("Regular")
+    vip_sold_out = vip_zone.get_available_tickets_count() == 0 if vip_zone else True
+    regular_sold_out = regular_zone.get_available_tickets_count() == 0 if regular_zone else True
+    
     return Titled(event.name, 
         P(f"Date: {event.date.strftime('%Y-%m-%d %H:%M:%S')}"),
+        P(f"Description: {event.description}"),
+        Img(src=f"/{event.image_url}", alt=event.name),
         H2("Zones"),
-        zones_info
+        zones_info,
+        Form(method="post", action=f"/purchase_tickets/{event.id}")(
+            P("VIP Quantity: ", Input(type="number", name="vip_quantity", min="0", required=True, disabled=vip_sold_out)),
+            P("Regular Quantity: ", Input(type="number", name="regular_quantity", min="0", required=True, disabled=regular_sold_out)),
+            Button("Buy Tickets", type="submit", disabled=vip_sold_out and regular_sold_out)
+        )
     )
 
-@rt("/purchase_tickets/{event_id:int}/{zone_type}", methods=["POST"])
-async def purchase_tickets(req, event_id: int, zone_type: str):
+@rt("/purchase_tickets/{event_id:int}", methods=["POST"])
+async def purchase_tickets(req, event_id: int):
     """Handle ticket purchases."""
     event = controller.get_event_by_id(event_id)
     if not event:
         return Titled("Error", P("Event not found"))
     
-    zone = event.zones.get(zone_type)
-    if not zone:
-        return Titled("Error", P("Zone not found"))
-    
     form = await req.form()
-    quantity = int(form.get("quantity", 0))  # Use req.form instead of app.request
-    if quantity <= 0:
+    vip_quantity = int(form.get("vip_quantity", 0))
+    regular_quantity = int(form.get("regular_quantity", 0))
+    
+    if vip_quantity <= 0 and regular_quantity <= 0:
         return Titled("Error", P("Invalid quantity"))
 
-    order = controller.create_order(buyer=user)
-    success = controller.purchase_tickets(order_id=order.id, zone=zone, quantity=quantity)
-    if not success:
+    vip_zone = event.zones.get("VIP")
+    regular_zone = event.zones.get("Regular")
+    vip_error = regular_error = None
+
+    if vip_quantity > 0 and vip_zone and vip_quantity > vip_zone.get_available_tickets_count():
+        vip_error = "Not enough VIP tickets available"
+
+    if regular_quantity > 0 and regular_zone and regular_quantity > regular_zone.get_available_tickets_count():
+        regular_error = "Not enough Regular tickets available"
+
+    if vip_error or regular_error:
+        return Titled("Error", 
+            P(vip_error) if vip_error else "",
+            P(regular_error) if regular_error else "",
+            A(href=f"/event/{event.id}")("Go Back")
+        )
+
+    current_user = get_current_user(req)
+    if not current_user:
+        return Titled("Error", P("User not logged in"))
+
+    order = controller.create_order(buyer=current_user)
+    success_vip = success_regular = True
+
+    if vip_quantity > 0:
+        success_vip = controller.purchase_tickets(order_id=order.id, zone=vip_zone, quantity=vip_quantity)
+
+    if regular_quantity > 0:
+        success_regular = controller.purchase_tickets(order_id=order.id, zone=regular_zone, quantity=regular_quantity)
+
+    if not success_vip and not success_regular:
         return Titled("Error", P("Failed to purchase tickets"))
-    
+
     controller.complete_order(order_id=order.id)
     return Titled("Success", 
         P(f"Order ID: {order.id}"),
-        P(f"Quantity: {quantity}"),
-        P(f"Zone: {zone_type}"),
+        P(f"VIP Quantity: {vip_quantity}"),
+        P(f"Regular Quantity: {regular_quantity}"),
         A(href="/user_tickets")("View My Tickets")
     )
 
 @rt("/user_tickets")
-def user_tickets():
+def user_tickets(req):
     """Display tickets owned by the user."""
-    user_tickets = controller.get_user_tickets(user.id)  # Use getter instead of accessing private variables
+    current_user = get_current_user(req)
+    if not current_user:
+        return Titled("Error", P("User not logged in"))
+    
+    user_tickets = controller.get_user_tickets(current_user.id)
+    if not user_tickets:
+        return Titled("My Tickets", P("No tickets found."))
+
     tickets_list = Ul(*[
-        Li(f"Ticket ID: {ticket.id}, Event: {ticket.zone.event.name}, Zone: {ticket.zone.type}, Status: {ticket.status.name}")
+        Li(f"Ticket ID: {ticket.id}, Event: {ticket.zone.event.name}, Zone: {ticket.zone.type}")
         for ticket in user_tickets
     ])
     return Titled("My Tickets", tickets_list)
@@ -131,56 +199,52 @@ async def create_event(req):
         form = await req.form()
         name = form.get("name")
         date = form.get("date")
+        description = form.get("description")
+        image_file = form.get("image_file")
         hall_id = int(form.get("hall_id"))
+        hall = controller.get_hall_by_id(hall_id)
         zones = [
-            {"type": "VIP", "percentage": float(form.get("vip_percentage")), "price": float(form.get("vip_price"))},
-            {"type": "Regular", "percentage": float(form.get("regular_percentage")), "price": float(form.get("regular_price"))}
+            {"type": "VIP", "percentage": float(form.get("vip_percentage")), "price": float(form.get("vip_price")), "quantity": int(hall.capacity * float(form.get("vip_percentage")) / 100)},
+            {"type": "Regular", "percentage": float(form.get("regular_percentage")), "price": float(form.get("regular_price")), "quantity": int(hall.capacity * float(form.get("regular_percentage")) / 100)}
         ]
 
-        hall = controller.get_hall_by_id(hall_id)
+        # Ensure the directory exists
+        image_dir = "static/images"
+        shutil.os.makedirs(image_dir, exist_ok=True)
+
+        # Save the uploaded image file
+        image_url = shutil.os.path.join(image_dir, image_file.filename)
+        with open(image_url, "wb") as f:
+            f.write(image_file.file.read())
+
         event = controller.create_event(
             name=name,
             date=datetime.strptime(date, "%Y-%m-%d"),
             organizer=user,
             hall=hall,
+            description=description,
+            image_url=image_url,
             zones=zones
         )
         return Titled("Event Created", P(f"Event '{event.name}' created successfully!"))
 
     halls = controller.get_halls()
-    hall_options = [Option(value=hall.id)(f"{hall.size} - Capacity: {hall.capacity}") for hall in halls]
+    used_halls = {event.hall.id for event in controller.get_events()}
+    available_halls = [hall for hall in halls if hall.id not in used_halls]
+    hall_options = [Option(value=hall.id)(f"ID: {hall.id} - {hall.size} - Capacity: {hall.capacity}") for hall in available_halls]
 
     return Titled("Create Event",
-        Form(method="post")(
+        Form(method="post", enctype="multipart/form-data")(
             P("Event Name: ", Input(type="text", name="name", required=True)),
             P("Event Date: ", Input(type="date", name="date", required=True)),
+            P("Description: ", Textarea(name="description", required=True)),
+            P("Image File: ", Input(type="file", name="image_file", accept="image/*", required=True)),
             P("Hall: ", Select(name="hall_id", required=True)(*hall_options)),
             P("VIP Zone Percentage: ", Input(type="number", name="vip_percentage", step="0.01", required=True)),
             P("VIP Zone Price: ", Input(type="number", name="vip_price", step="0.01", required=True)),
             P("Regular Zone Percentage: ", Input(type="number", name="regular_percentage", step="0.01", required=True)),
             P("Regular Zone Price: ", Input(type="number", name="regular_price", step="0.01", required=True)),
             Button("Create Event", type="submit")
-        )
-    )
-
-@rt("/login", methods=["GET", "POST"])
-async def login(req):
-    """User login."""
-    if req.method == "POST":
-        form = await req.form()
-        email = form.get("email")
-        password = form.get("password")
-        user = controller.authenticate_user(email, password)
-        if user:
-            return Titled("Login Successful", P(f"Welcome, {user.name}!"))
-        else:
-            return Titled("Login Failed", P("Invalid email or password."))
-
-    return Titled("Login",
-        Form(method="post")(
-            P("Email: ", Input(type="email", name="email", required=True)),
-            P("Password: ", Input(type="password", name="password", required=True)),
-            Button("Login", type="submit")
         )
     )
 
@@ -192,8 +256,8 @@ async def register(req):
         name = form.get("name")
         email = form.get("email")
         password = form.get("password")
-        roles = ["Buyer"]  # Default role
-        user = controller.create_user(name=name, email=email, password=password, roles=roles)
+        hashed_password = hashlib.sha256(password.encode()).hexdigest()
+        user = controller.create_user(name=name, email=email, password=hashed_password, roles=["Buyer"])
         return Titled("Registration Successful", P(f"User '{user.name}' registered successfully!"))
 
     return Titled("Register",
@@ -204,5 +268,40 @@ async def register(req):
             Button("Register", type="submit")
         )
     )
+
+@rt("/login", methods=["GET", "POST"])
+async def login(req):
+    """User login."""
+    if req.method == "POST":
+        form = await req.form()
+        email = form.get("email")
+        password = form.get("password")
+        hashed_password = hashlib.sha256(password.encode()).hexdigest()
+        user = controller.authenticate_user(email=email, password=hashed_password)
+        if user:
+            session_id = hashlib.sha256(f"{user.id}{datetime.now()}".encode()).hexdigest()
+            sessions[session_id] = user
+            res = RedirectResponse(url="/")
+            res.set_cookie("session_id", session_id)
+            return res
+        return Titled("Login Failed", P("Invalid email or password"))
+
+    return Titled("Login",
+        Form(method="post")(
+            P("Email: ", Input(type="email", name="email", required=True)),
+            P("Password: ", Input(type="password", name="password", required=True)),
+            Button("Login", type="submit")
+        )
+    )
+
+@rt("/logout")
+def logout(req):
+    """User logout."""
+    session_id = req.cookies.get("session_id")
+    if session_id and session_id in sessions:
+        del sessions[session_id]
+    res = RedirectResponse(url="/")
+    res.delete_cookie("session_id")
+    return res
 
 serve()

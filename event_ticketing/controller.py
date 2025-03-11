@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from enum import Enum
 import logging
+import hashlib
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -36,7 +37,7 @@ class User:
         self.__id = User.user_counter  # Auto-generate ID
         self.__name = name
         self.__email = email
-        self.__password = password
+        self.__password = hashlib.sha256(password.encode()).hexdigest()
         self.__roles = roles
 
     # Getter for id
@@ -73,18 +74,21 @@ class User:
             logging.info(f"Role '{role}' removed from user '{self.name}'.")
 
     def verify_password(self, password: str) -> bool:
-        return self.__password == password
+        hashed_password = hashlib.sha256(password.encode()).hexdigest()
+        return self.__password == hashed_password
 
 class Event:
     event_counter = 0  # Static counter for Event IDs
 
-    def __init__(self, name: str, date: datetime, organizer: User, hall: 'Hall'):
+    def __init__(self, name: str, date: datetime, organizer: User, hall: 'Hall', description: str, image_url: str):
         Event.event_counter += 1
         self.__id = Event.event_counter  # Auto-generate ID
         self.__name = name
         self.__date = date
         self.__organizer = organizer
         self.__hall = hall
+        self.__description = description
+        self.__image_url = image_url
         self.__zones: Dict[str, 'Zone'] = {}
 
     # Getter for id
@@ -102,6 +106,21 @@ class Event:
     def date(self):
         return self.__date
 
+    # Getter for description
+    @property
+    def description(self):
+        return self.__description
+
+    # Getter for image_url
+    @property
+    def image_url(self):
+        return self.__image_url
+
+    # Getter for hall
+    @property
+    def hall(self):
+        return self.__hall
+
     # Getter for zones
     @property
     def zones(self):
@@ -115,21 +134,21 @@ class Event:
         logging.info(f"Zone '{zone.type}' added to event '{self.name}'.")
         return True
 
-    def add_zone_with_percentage(self, zone_type: str, percentage: float, price: float, user: User):
+    def add_zone_with_percentage(self, zone_type: str, percentage: float, price: float, quantity: int, user: User):
         """
         Add a zone with a percentage of the hall's capacity.
         :param zone_type: Type of the zone (e.g., "VIP", "Regular")
         :param percentage: Percentage of the hall's capacity (e.g., 0.2 for 20%)
         :param price: Price of tickets in this zone
+        :param quantity: Number of tickets in this zone
         :param user: User adding the zone (must be an EventOrganizer)
         """
         if not user.has_role("EventOrganizer"):
             logging.error(f"User '{user.name}' does not have permission to add zones.")
             return False
-        capacity = int(self.__hall.capacity * percentage)
-        zone = Zone(type=zone_type, capacity=capacity, price=price, event=self)
+        zone = Zone(type=zone_type, capacity=quantity, price=price, event=self)
         self.add_zone(zone, user)
-        logging.info(f"Zone '{zone_type}' added with {capacity} seats ({percentage * 100}% of hall capacity).")
+        logging.info(f"Zone '{zone_type}' added with {quantity} seats ({percentage * 100}% of hall capacity).")
         return True
 
     def display_event_info(self):
@@ -138,6 +157,8 @@ class Event:
         print(f"Event Name: {self.name}")
         print(f"Event Date: {self.date.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Organizer: {self.__organizer.name}")
+        print(f"Description: {self.description}")
+        print(f"Image URL: {self.image_url}")
         print("Zones:")
         for zone_type, zone in self.__zones.items():
             print(f"  - {zone_type}: {zone.get_available_tickets_count()} available tickets out of {zone.capacity}")
@@ -413,6 +434,8 @@ class Controller:
         self.__user_tickets[user.id] = UserTickets(user=user)
         logging.info(f"User '{name}' created with roles: {roles}.")
         return user
+    def get_users(self) -> List[User]:
+        return self.__users
 
     def get_user_by_id(self, user_id: int) -> Optional[User]:
         for user in self.__users:
@@ -452,29 +475,31 @@ class Controller:
         return []
 
     # Event Management
-    def create_event(self, name: str, date: datetime, organizer: User, hall: Hall, zones: List[Dict[str, float]]) -> Event:
+    def create_event(self, name: str, date: datetime, organizer: User, hall: Hall, description: str, image_url: str, zones: List[Dict[str, float]]) -> Event:
         """
         Create an event and automatically add zones.
         :param name: Name of the event
         :param date: Date of the event
         :param organizer: Organizer of the event
         :param hall: Hall where the event will be held
-        :param zones: List of zones to be added with their percentage and price
+        :param description: Description of the event
+        :param image_url: URL of the event image
+        :param zones: List of zones to be added with their percentage, price, and quantity
         :return: Created Event object
         """
-        event = Event(name=name, date=date, organizer=organizer, hall=hall)
+        event = Event(name=name, date=date, organizer=organizer, hall=hall, description=description, image_url=image_url)
         self.__events.append(event)
         logging.info(f"Event '{name}' created by '{organizer.name}'.")
 
         for zone in zones:
-            self.add_zone_to_event(event_id=event.id, zone_type=zone['type'], percentage=zone['percentage'], price=zone['price'], user=organizer)
+            self.add_zone_to_event(event_id=event.id, zone_type=zone['type'], percentage=zone['percentage'], price=zone['price'], quantity=zone['quantity'], user=organizer)
 
         return event
 
-    def add_zone_to_event(self, event_id: int, zone_type: str, percentage: float, price: float, user: User) -> bool:
+    def add_zone_to_event(self, event_id: int, zone_type: str, percentage: float, price: float, quantity: int, user: User) -> bool:
         event = self.get_event_by_id(event_id)
         if event:
-            return event.add_zone_with_percentage(zone_type=zone_type, percentage=percentage, price=price, user=user)
+            return event.add_zone_with_percentage(zone_type=zone_type, percentage=percentage, price=price, quantity=quantity, user=user)
         return False
 
     def get_event_by_id(self, event_id: int) -> Optional[Event]:
@@ -639,9 +664,11 @@ if __name__ == "__main__":
         date=datetime(2023, 8, 15),
         organizer=user,
         hall=hall_1_large,
+        description="A grand concert featuring popular artists.",
+        image_url="http://example.com/concert.jpg",
         zones=[
-            {"type": "VIP", "percentage": 0.2, "price": 150.0},
-            {"type": "Regular", "percentage": 0.8, "price": 50.0}
+            {"type": "VIP", "percentage": 0.2, "price": 150.0, "quantity": 200},
+            {"type": "Regular", "percentage": 0.8, "price": 50.0, "quantity": 800}
         ]
     )
     event_2 = controller.create_event(
@@ -649,9 +676,11 @@ if __name__ == "__main__":
         date=datetime(2023, 9, 20),
         organizer=user,
         hall=hall_2_medium,
+        description="An engaging theatre play.",
+        image_url="http://example.com/theatre.jpg",
         zones=[
-            {"type": "VIP", "percentage": 0.1, "price": 100.0},
-            {"type": "Regular", "percentage": 0.9, "price": 30.0}
+            {"type": "VIP", "percentage": 0.1, "price": 100.0, "quantity": 50},
+            {"type": "Regular", "percentage": 0.9, "price": 30.0, "quantity": 450}
         ]
     )
     event_3 = controller.create_event(
@@ -659,8 +688,10 @@ if __name__ == "__main__":
         date=datetime(2023, 10, 25),
         organizer=user,
         hall=hall_3_small,
+        description="A conference on technology and innovation.",
+        image_url="http://example.com/conference.jpg",
         zones=[
-            {"type": "Regular", "percentage": 1.0, "price": 20.0}
+            {"type": "Regular", "percentage": 1.0, "price": 20.0, "quantity": 200}
         ]
     )
 
